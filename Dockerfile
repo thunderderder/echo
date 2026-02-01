@@ -23,7 +23,7 @@ COPY . .
 RUN npm run build
 
 # Expose port (PORT will be set at runtime by Koyeb)
-EXPOSE 8000
+EXPOSE 8001
 
 # Start application using PORT environment variable
 # Use shell form (sh -c) to ensure environment variable expansion
