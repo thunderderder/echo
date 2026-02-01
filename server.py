@@ -131,9 +131,8 @@ class CheckInsightResponse(BaseModel):
     computedEmbeddings: Optional[List[dict]] = None  # 重新计算的embedding列表
 
 
-@app.get("/")
-async def root():
-    return {"message": "想法记录 API 服务运行中"}
+# 根路径路由已移除，由静态文件服务处理（见文件末尾）
+# 如果需要健康检查端点，可以使用 /health 或 /api/health
 
 
 @app.post("/api/transcribe")
@@ -1100,6 +1099,16 @@ if dist_path.exists():
     
     # 提供 index.html 和其他静态文件
     # 这个路由应该最后定义，作为 fallback
+    # 处理根路径 - 返回 index.html
+    @app.get("/")
+    async def serve_root():
+        """服务前端应用的根路径"""
+        index_path = dist_path / "index.html"
+        if index_path.exists():
+            return FileResponse(str(index_path))
+        raise HTTPException(status_code=404, detail="Frontend not found. Please ensure dist directory exists.")
+    
+    # 处理其他路径 - SPA 路由和静态文件
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         """
@@ -1107,7 +1116,7 @@ if dist_path.exists():
         所有非 API 路由都返回 index.html，让前端路由处理
         """
         # 如果请求的是 API 路径，不应该到这里（FastAPI 会先匹配 API 路由）
-        if full_path.startswith("api") or full_path == "docs" or full_path == "redoc" or full_path == "openapi.json":
+        if full_path.startswith("api") or full_path in ["docs", "redoc", "openapi.json"]:
             raise HTTPException(status_code=404)
         
         # 检查请求的文件是否存在
@@ -1125,5 +1134,5 @@ if dist_path.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8001))
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
