@@ -1,0 +1,9 @@
+{
+  "repo_url": "https://github.com/thunderderder/echo",
+  "service_name": "echo",
+  "branch": "main",
+  "port": 8000,
+  "env_vars": {
+    "OPENAI_API_KEY": "sk_56f40c3c_4711e351bc6e7b71802f7eaa888fbdf6ac9b"
+  }
+}

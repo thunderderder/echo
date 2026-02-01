@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 import os
@@ -59,6 +60,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 静态文件服务将在所有 API 路由定义后配置（见文件末尾）
+
 
 class Thought(BaseModel):
     id: int
@@ -114,6 +117,18 @@ class CrossDateInsightResponse(BaseModel):
     echoes: List[dict]  # 呼应关系列表
     summary: str  # 洞察总结
     computedEmbeddings: Optional[List[dict]] = None  # 重新计算的embedding列表，格式: [{"thoughtId": int, "embedding": List[float], "model": str}]
+
+
+class CheckInsightRequest(BaseModel):
+    thought: Thought  # 当前想法
+    historyThoughts: List[ThoughtWithEmbedding]  # 历史想法（包含embedding信息）
+
+
+class CheckInsightResponse(BaseModel):
+    worthTalking: bool  # 是否值得聊
+    question: Optional[str] = None  # 引导性问题（如果值得聊）
+    thinking: Optional[str] = None  # 思考内容（不显示给用户）
+    computedEmbeddings: Optional[List[dict]] = None  # 重新计算的embedding列表
 
 
 @app.get("/")
@@ -333,7 +348,10 @@ async def conversation(request: ConversationRequest):
         [f"{index + 1}. {thought.content}" for index, thought in enumerate(request.thoughts)]
     )
     
-    # 构建系统提示词
+    # ========== Prompt阶段3：对话系统Prompt ==========
+    # 目的：定义AI在对话中的角色和行为准则
+    # 特点：系统级Prompt，影响所有对话回复
+    # 使用场景：每次对话时作为系统消息传入
     system_prompt = f"""## 核心定位
 你是一名自然、聪明、可以适当“越界”但温暖的思考陪伴助手。
 你不追求“正确回应”，而追求让用户更愿意继续表达或思考，或安心停下。
@@ -495,6 +513,9 @@ async def tag_and_embedding(request: TagAndEmbeddingRequest):
             "渴望被认可", "边界", "比较", "控制感", "满足", "困惑"
         ]
         
+        # ========== Prompt阶段0：标签生成 ==========
+        # 目的：为想法打标签（层A：稳定主题 + 层B：心理维度）
+        # 特点：使用固定标签集合，从预定义列表中选择
         tag_prompt = f"""你是一名想法标签助手。请为用户的这条想法打标签。
 
 可用标签列表（只能从这些标签中选择，可以选多个，用逗号分隔）：
@@ -505,7 +526,7 @@ async def tag_and_embedding(request: TagAndEmbeddingRequest):
 要求：
 1. 只返回标签名称，多个标签用逗号分隔，不要有其他说明
 2. 优先选择最相关的1-3个标签
-3. 如果确实不相关，返回"其他"
+3. 如果确实不相关，返回你觉得相关的其他1-3个标签
 
 用户想法：
 {thought.content}
@@ -780,7 +801,329 @@ async def cross_date_insight(request: CrossDateInsightRequest):
         raise HTTPException(status_code=500, detail=f"历史洞察失败: {str(e)}")
 
 
+@app.post("/api/check-insight", response_model=CheckInsightResponse)
+async def check_insight(request: CheckInsightRequest):
+    """
+    接口：判断单个想法是否值得聊
+    流程：embedding → 单点洞察判断 → 与历史想法相似度计算 → 聚类/呼应检测 → 历史洞察判断
+    """
+    print("=" * 80)
+    print("=== 单个想法洞察判断请求开始 ===")
+    
+    if not api_key:
+        raise HTTPException(status_code=500, detail="API Key 未配置")
+    
+    thought = request.thought
+    
+    try:
+        base_url = os.getenv("BASE_URL", "https://space.ai-builders.com/backend/v1")
+        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        
+        # 1. 生成当前想法的embedding
+        print(f"\n--- 步骤1: 生成当前想法的embedding ---")
+        print(f"想法内容: {thought.content}")
+        
+        embedding_response = await client.embeddings.create(
+            model="text-embedding-3-small",
+            input=thought.content
+        )
+        current_embedding = embedding_response.data[0].embedding
+        embedding_model = embedding_response.model
+        print(f"Embedding生成完成，维度: {len(current_embedding)}")
+        
+        # 2. 单点洞察判断：判断这个想法本身是否值得深入
+        print(f"\n--- 步骤2: 单点洞察判断 ---")
+        # ========== Prompt阶段1：单点洞察判断 ==========
+        # 目的：判断单个想法本身是否值得深入聊
+        # 输出：JSON格式 {worthTalking: bool, reason: str}
+        # 使用场景：用户输入想法后自动调用，判断是否显示"！"图标
+        single_point_prompt = f"""你是一名"洞察触发型思考陪伴助手"。
+
+用户记录了一条想法。你的任务是判断这条想法是否值得深入聊一聊。
+
+判断标准：
+1. 是否可能引发"更深一层理解"
+2. 是否涉及判断方式、归因习惯、视角冲突、认知张力等
+3. 是否可能改变用户"看待问题的方式"
+
+如果值得聊，返回JSON格式：{{"worthTalking": true, "reason": "简短原因"}}
+如果不值得聊，返回JSON格式：{{"worthTalking": false, "reason": "简短原因"}}
+
+只返回JSON，不要有其他说明。
+
+用户想法：
+{thought.content}
+"""
+        
+        single_point_response = await client.chat.completions.create(
+            model="gpt-5",
+            messages=[
+                {
+                    "role": "user",
+                    "content": single_point_prompt
+                }
+            ]
+        )
+        
+        single_point_result = single_point_response.choices[0].message.content.strip()
+        print(f"单点洞察判断结果: {single_point_result}")
+        
+        # 解析单点洞察结果
+        import json
+        try:
+            # 尝试提取JSON（可能包含markdown代码块）
+            if "```json" in single_point_result:
+                json_start = single_point_result.find("```json") + 7
+                json_end = single_point_result.find("```", json_start)
+                single_point_result = single_point_result[json_start:json_end].strip()
+            elif "```" in single_point_result:
+                json_start = single_point_result.find("```") + 3
+                json_end = single_point_result.find("```", json_start)
+                single_point_result = single_point_result[json_start:json_end].strip()
+            
+            single_point_data = json.loads(single_point_result)
+            single_point_worth = single_point_data.get("worthTalking", False)
+        except:
+            # 如果解析失败，默认不值得聊
+            single_point_worth = False
+            print("单点洞察结果解析失败，默认不值得聊")
+        
+        # 3. 与历史想法相似度计算和呼应检测
+        print(f"\n--- 步骤3: 与历史想法相似度计算 ---")
+        history_with_embeddings = []
+        thoughts_needing_embedding = []
+        computed_embeddings_for_frontend = []
+        
+        if request.historyThoughts:
+            for hist_thought in request.historyThoughts:
+                if hist_thought.embedding:
+                    history_with_embeddings.append({
+                        'thought': Thought(id=hist_thought.id, content=hist_thought.content, createdAt=hist_thought.createdAt),
+                        'embedding': hist_thought.embedding
+                    })
+                else:
+                    thoughts_needing_embedding.append(hist_thought)
+            
+            # 批量计算缺失的embedding
+            if thoughts_needing_embedding:
+                print(f"需要重新计算 {len(thoughts_needing_embedding)} 个历史想法的embedding")
+                missing_contents = [t.content for t in thoughts_needing_embedding]
+                missing_embeddings_response = await client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=missing_contents
+                )
+                for thought, emb_data in zip(thoughts_needing_embedding, missing_embeddings_response.data):
+                    computed_embeddings_for_frontend.append({
+                        'thoughtId': thought.id,
+                        'embedding': emb_data.embedding,
+                        'model': missing_embeddings_response.model
+                    })
+                    history_with_embeddings.append({
+                        'thought': Thought(id=thought.id, content=thought.content, createdAt=thought.createdAt),
+                        'embedding': emb_data.embedding
+                    })
+            
+            # 计算相似度，找出相关历史想法
+            similarity_threshold = 0.5
+            related_thoughts = []
+            
+            for hist_item in history_with_embeddings:
+                # 排除当前想法本身
+                if hist_item['thought'].id == thought.id:
+                    continue
+                
+                similarity = cosine_similarity(current_embedding, hist_item['embedding'])
+                if similarity > similarity_threshold:
+                    related_thoughts.append({
+                        'thought': hist_item['thought'],
+                        'similarity': similarity
+                    })
+            
+            # 按相似度排序，取前5个
+            related_thoughts.sort(key=lambda x: x['similarity'], reverse=True)
+            related_thoughts = related_thoughts[:5]
+            
+            print(f"找到 {len(related_thoughts)} 个相关历史想法")
+            
+            # 4. 如果有相关历史想法，进行历史洞察判断
+            history_worth = False
+            history_question = None
+            history_thinking = None
+            
+            if related_thoughts:
+                print(f"\n--- 步骤4: 历史洞察判断 ---")
+                echo_texts = []
+                for rel in related_thoughts:
+                    hist_date = rel['thought'].createdAt[:10]
+                    hist_content = rel['thought'].content
+                    similarity_score = rel['similarity']
+                    echo_texts.append(f"  - [{hist_date}] {hist_content} (相似度: {similarity_score:.2f})")
+                
+                # ========== Prompt阶段2：历史洞察判断 ==========
+                # 目的：判断当前想法与历史想法的呼应是否值得聊
+                # 输出：JSON格式 {worthTalking: bool, question: str?, thinking: str?}
+                # 使用场景：用户输入想法后自动调用，判断是否显示"！"图标
+                history_insight_prompt = f"""你是一名"历史线索提示型"的思考陪伴助手。
+
+用户的新想法与过去的一些想法产生了呼应。
+你的任务是判断这种呼应是否值得深入聊一聊。
+
+判断标准：
+1. 是否揭示了一个逐渐浮现的模式或张力
+2. 是否可能引发"更深一层理解"
+3. 是否值得用户注意和思考
+
+如果值得聊，返回JSON格式：{{"worthTalking": true, "question": "引导性问题", "thinking": "思考内容"}}
+如果不值得聊，返回JSON格式：{{"worthTalking": false, "reason": "简短原因"}}
+
+引导性问题的要求：
+1. 不要总结、解释或评价用户的想法
+2. 不要替用户下结论，也不要暗示"正确答案"
+3. 不要给建议、方法或行动指令
+4. 问题应像一个"钩子"：轻、开放、允许用户接或不接
+5. 只输出一句话，只输出问题本身
+
+当前想法：{thought.content}
+
+相关历史想法：
+{chr(10).join(echo_texts)}
+
+只返回JSON，不要有其他说明。
+"""
+                
+                history_insight_response = await client.chat.completions.create(
+                    model="gpt-5",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": history_insight_prompt
+                        }
+                    ]
+                )
+                
+                history_result = history_insight_response.choices[0].message.content.strip()
+                print(f"历史洞察判断结果: {history_result}")
+                
+                try:
+                    # 尝试提取JSON
+                    if "```json" in history_result:
+                        json_start = history_result.find("```json") + 7
+                        json_end = history_result.find("```", json_start)
+                        history_result = history_result[json_start:json_end].strip()
+                    elif "```" in history_result:
+                        json_start = history_result.find("```") + 3
+                        json_end = history_result.find("```", json_start)
+                        history_result = history_result[json_start:json_end].strip()
+                    
+                    history_data = json.loads(history_result)
+                    history_worth = history_data.get("worthTalking", False)
+                    if history_worth:
+                        history_question = history_data.get("question", "")
+                        history_thinking = json.dumps({
+                            "relatedThoughts": related_thoughts,
+                            "reason": history_data.get("thinking", "")
+                        })
+                except:
+                    print("历史洞察结果解析失败")
+        else:
+            print("没有历史想法，跳过历史洞察判断")
+        
+        # 5. 综合判断：单点洞察或历史洞察任一值得聊，就值得聊
+        worth_talking = single_point_worth or history_worth
+        final_question = history_question if history_worth else None
+        final_thinking = history_thinking if history_worth else None
+        
+        # 如果单点值得聊但没有历史呼应，生成单点问题
+        if single_point_worth and not history_worth:
+            print(f"\n--- 步骤5: 生成单点洞察问题 ---")
+            # ========== Prompt阶段2.5：单点问题生成 ==========
+            # 目的：如果单点值得聊但没有历史呼应，生成引导性问题
+            # 输出：纯文本问题
+            # 使用场景：单点洞察判断为值得聊，但没有找到历史呼应时
+            single_question_prompt = f"""你是一名"洞察触发型思考陪伴助手"。
+
+用户记录了一条想法。请生成一句引导性问题，作为洞察的入口。
+
+要求：
+1. 不要总结、解释或评价用户的想法
+2. 不要替用户下结论，也不要暗示"正确答案"
+3. 不要给建议、方法或行动指令
+4. 问题应像一个"钩子"：轻、开放、允许用户接或不接
+5. 只输出一句话，只输出问题本身，不加任何说明
+
+用户想法：
+{thought.content}
+"""
+            
+            single_question_response = await client.chat.completions.create(
+                model="gpt-5",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": single_question_prompt
+                    }
+                ]
+            )
+            
+            final_question = single_question_response.choices[0].message.content.strip()
+            final_thinking = json.dumps({"type": "single_point", "reason": single_point_data.get("reason", "")})
+        
+        print(f"\n=== 单个想法洞察判断完成 ===")
+        print(f"是否值得聊: {worth_talking}")
+        if worth_talking:
+            print(f"引导性问题: {final_question}")
+        print("=" * 80)
+        
+        return CheckInsightResponse(
+            worthTalking=worth_talking,
+            question=final_question,
+            thinking=final_thinking,
+            computedEmbeddings=computed_embeddings_for_frontend if computed_embeddings_for_frontend else None
+        )
+        
+    except Exception as e:
+        import traceback
+        error_detail = f"单个想法洞察判断失败: {str(e)}\n{traceback.format_exc()}"
+        print("=" * 80)
+        print("=== 单个想法洞察判断出错 ===")
+        print(error_detail)
+        print("=" * 80)
+        raise HTTPException(status_code=500, detail=f"单个想法洞察判断失败: {str(e)}")
+
+
+# 配置静态文件服务（用于生产环境部署）
+# 必须在所有 API 路由定义之后，确保 API 路由优先匹配
+dist_path = Path(__file__).parent / "dist"
+if dist_path.exists():
+    # 挂载静态资源目录（CSS、JS 等）
+    app.mount("/assets", StaticFiles(directory=str(dist_path / "assets")), name="assets")
+    
+    # 提供 index.html 和其他静态文件
+    # 这个路由应该最后定义，作为 fallback
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """
+        服务前端 SPA 应用
+        所有非 API 路由都返回 index.html，让前端路由处理
+        """
+        # 如果请求的是 API 路径，不应该到这里（FastAPI 会先匹配 API 路由）
+        if full_path.startswith("api") or full_path == "docs" or full_path == "redoc" or full_path == "openapi.json":
+            raise HTTPException(status_code=404)
+        
+        # 检查请求的文件是否存在
+        file_path = dist_path / full_path
+        if file_path.exists() and file_path.is_file():
+            return FileResponse(str(file_path))
+        
+        # 否则返回 index.html（用于前端路由）
+        index_path = dist_path / "index.html"
+        if index_path.exists():
+            return FileResponse(str(index_path))
+        
+        raise HTTPException(status_code=404, detail="File not found")
+
+
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 3001))
+    port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)

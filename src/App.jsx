@@ -96,6 +96,8 @@ function App() {
   const prevSelectedDateRef = useRef(null) // 跟踪上一次的 selectedDate，用于切换日期时保存旧数据
   const [isLoadingTagging, setIsLoadingTagging] = useState(false) // 打标签和embedding的加载状态
   const [isLoadingCrossInsight, setIsLoadingCrossInsight] = useState(false) // 历史洞察加载状态
+  const [thoughtInsights, setThoughtInsights] = useState({}) // 存储每个想法的洞察结果 {thoughtId: {worthTalking: boolean, question: string, thinking: string}}
+  const [hoveredThoughtId, setHoveredThoughtId] = useState(null) // 当前悬停的想法ID
 
   // 语音输入处理
   const handleVoiceInput = async () => {
@@ -223,6 +225,7 @@ function App() {
     setShowSummaryConfirm(true)
   }
 
+
   // 确认总结后执行（接口1：今日洞察）
   const handleConfirmSummary = async () => {
     setShowSummaryConfirm(false)
@@ -254,6 +257,11 @@ function App() {
         setDailySummary(summaryText)
         setAiQuestion(data.question) // 单独保存AI问题
         setAiThinking(data.thinking || '') // 保存思考内容（不显示给用户）
+        
+        // 保存到本地存储
+        const todayKey = getDateKey()
+        saveConversationHistory(todayKey, [], data.question, data.thinking || '', false)
+        
         // 调试：打印AI返回的问题和思考内容
         console.log('AI返回的问题:', data.question)
         console.log('AI思考内容（不显示）:', data.thinking)
@@ -528,6 +536,16 @@ function App() {
       }
     }
     
+    // 加载想法的洞察结果
+    const savedInsights = localStorage.getItem('thoughtInsights')
+    if (savedInsights) {
+      try {
+        setThoughtInsights(JSON.parse(savedInsights))
+      } catch (e) {
+        console.error('加载洞察结果失败:', e)
+      }
+    }
+    
     // 检查今天是否已封存
     setTodaySealed(checkTodaySealed())
     
@@ -609,6 +627,127 @@ function App() {
     }
   }
 
+  // 检查想法是否值得聊（单点洞察+历史呼应）
+  const checkThoughtInsight = async (thought) => {
+    try {
+      // 获取所有历史想法（排除当前想法）
+      const allHistoryThoughts = thoughts.filter(t => t.id !== thought.id)
+      
+      if (allHistoryThoughts.length === 0) {
+        // 没有历史想法，只做单点判断
+        const historyThoughtsWithEmbeddings = []
+        
+        // 调用后端接口
+        const response = await fetch('/api/check-insight', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ 
+            thought: thought,
+            historyThoughts: historyThoughtsWithEmbeddings
+          }),
+        })
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({ detail: '请求失败' }))
+          console.error('洞察判断失败:', errorData.detail)
+          return
+        }
+
+        const data = await response.json()
+        
+        // 保存洞察结果
+        setThoughtInsights(prev => {
+          const newInsights = {
+            ...prev,
+            [thought.id]: {
+              worthTalking: data.worthTalking,
+              question: data.question || null,
+              thinking: data.thinking || null
+            }
+          }
+          // 保存到本地存储
+          localStorage.setItem('thoughtInsights', JSON.stringify(newInsights))
+          return newInsights
+        })
+        
+        // 如果后端重新计算了某些想法的embedding，保存到本地存储
+        if (data.computedEmbeddings && data.computedEmbeddings.length > 0) {
+          for (const item of data.computedEmbeddings) {
+            const histThought = allHistoryThoughts.find(t => t.id === item.thoughtId)
+            if (histThought) {
+              setEmbedding(item.thoughtId, item.embedding, histThought.content, item.model)
+            }
+          }
+        }
+        
+        console.log(`想法 ${thought.id} 洞察判断完成:`, data.worthTalking ? '值得聊' : '不值得聊')
+      } else {
+        // 有历史想法，获取它们的embedding
+        const historyThoughtsWithEmbeddings = []
+        for (const histThought of allHistoryThoughts) {
+          const embedding = getEmbedding(histThought.id)
+          historyThoughtsWithEmbeddings.push({
+            id: histThought.id,
+            content: histThought.content,
+            createdAt: histThought.createdAt,
+            embedding: embedding ? embedding.vector : null
+          })
+        }
+        
+        // 调用后端接口
+        const response = await fetch('/api/check-insight', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ 
+            thought: thought,
+            historyThoughts: historyThoughtsWithEmbeddings
+          }),
+        })
+
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({ detail: '请求失败' }))
+          console.error('洞察判断失败:', errorData.detail)
+          return
+        }
+
+        const data = await response.json()
+        
+        // 保存洞察结果
+        setThoughtInsights(prev => {
+          const newInsights = {
+            ...prev,
+            [thought.id]: {
+              worthTalking: data.worthTalking,
+              question: data.question || null,
+              thinking: data.thinking || null
+            }
+          }
+          // 保存到本地存储
+          localStorage.setItem('thoughtInsights', JSON.stringify(newInsights))
+          return newInsights
+        })
+        
+        // 如果后端重新计算了某些想法的embedding，保存到本地存储
+        if (data.computedEmbeddings && data.computedEmbeddings.length > 0) {
+          for (const item of data.computedEmbeddings) {
+            const histThought = allHistoryThoughts.find(t => t.id === item.thoughtId)
+            if (histThought) {
+              setEmbedding(item.thoughtId, item.embedding, histThought.content, item.model)
+            }
+          }
+        }
+        
+        console.log(`想法 ${thought.id} 洞察判断完成:`, data.worthTalking ? '值得聊' : '不值得聊')
+      }
+    } catch (error) {
+      console.error('洞察判断出错:', error)
+    }
+  }
+
   // 处理用户输入
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -645,7 +784,12 @@ function App() {
       saveThoughts(updatedThoughts)
       
       // 异步打标签和生成embedding（不阻塞保存）
-      tagAndEmbedThought(newThought).catch(err => {
+      tagAndEmbedThought(newThought).then(() => {
+        // embedding生成完成后，检查洞察
+        checkThoughtInsight(newThought).catch(err => {
+          console.error('后台洞察判断失败:', err)
+        })
+      }).catch(err => {
         console.error('后台打标签失败:', err)
       })
       
@@ -695,10 +839,18 @@ function App() {
 
   const confirmDelete = () => {
     if (showDeleteConfirm) {
-      const updatedThoughts = thoughts.filter((thought) => thought.id !== showDeleteConfirm)
+      const deletedId = showDeleteConfirm
+      const updatedThoughts = thoughts.filter((thought) => thought.id !== deletedId)
       saveThoughts(updatedThoughts)
       // 删除对应的embedding
-      deleteEmbedding(showDeleteConfirm)
+      deleteEmbedding(deletedId)
+      // 删除对应的洞察结果
+      setThoughtInsights(prev => {
+        const newInsights = { ...prev }
+        delete newInsights[deletedId]
+        localStorage.setItem('thoughtInsights', JSON.stringify(newInsights))
+        return newInsights
+      })
       setShowDeleteConfirm(null)
     }
   }
@@ -726,10 +878,23 @@ function App() {
       // 重新生成embedding（内容已变化）
       const editedThought = updatedThoughts.find(t => t.id === id)
       if (editedThought && needsReembedding(id, editedThought.content)) {
-        tagAndEmbedThought(editedThought).catch(err => {
+        tagAndEmbedThought(editedThought).then(() => {
+          // embedding生成完成后，重新检查洞察
+          checkThoughtInsight(editedThought).catch(err => {
+            console.error('重新检查洞察失败:', err)
+          })
+        }).catch(err => {
           console.error('重新生成embedding失败:', err)
         })
       }
+      
+      // 清除旧的洞察结果（因为内容已变化）
+      setThoughtInsights(prev => {
+        const newInsights = { ...prev }
+        delete newInsights[id]
+        localStorage.setItem('thoughtInsights', JSON.stringify(newInsights))
+        return newInsights
+      })
       
       setEditingId(null)
       setEditingContent('')
@@ -1169,6 +1334,31 @@ function App() {
     saveConversationHistory(dateKey, conversation, aiQuestion, aiThinking, true)
   }
 
+  // 处理点击"聊聊"按钮
+  const handleStartConversation = async (thoughtId) => {
+    const insight = thoughtInsights[thoughtId]
+    if (!insight || !insight.worthTalking) {
+      return
+    }
+
+    // 设置AI问题和思考内容
+    setAiQuestion(insight.question)
+    setAiThinking(insight.thinking || '')
+    setConversation([])
+    setConversationPaused(false)
+    
+    // 保存到本地存储
+    const dateKey = selectedDate ? getDateKey(selectedDate) : getDateKey()
+    saveConversationHistory(dateKey, [], insight.question, insight.thinking || '', false)
+    
+    // 聚焦输入框
+    setTimeout(() => {
+      if (inputRef.current) {
+        inputRef.current.focus()
+      }
+    }, 100)
+  }
+
   // 继续对话（点击"…"后）
   const handleResumeConversation = () => {
     setConversationPaused(false)
@@ -1192,6 +1382,7 @@ function App() {
     setAiThinking(null)
     setConversationPaused(false)
     setTodaySealed(false) // 取消封存，允许继续输入
+    setHoveredThoughtId(null) // 清除悬停状态
     
     // 清除本地存储的对话历史
     const dateKey = selectedDate ? getDateKey(selectedDate) : getDateKey()
@@ -1209,6 +1400,7 @@ function App() {
   const cancelClearConversation = () => {
     setShowClearConversationConfirm(false)
   }
+
 
   // 快捷键处理：Cmd/Ctrl + Enter 存入对话
   useEffect(() => {
@@ -1918,7 +2110,7 @@ function App() {
                 </div>
               ) : (
                 displayThoughts.map((thought) => (
-                  <div key={thought.id} className="thought-card-mini">
+                  <div key={thought.id} className="thought-card-mini" style={{ position: 'relative' }}>
                     {editingId === thought.id ? (
                       <div className="edit-mode-mini">
                         <textarea
@@ -1958,8 +2150,96 @@ function App() {
                           className="thought-content-mini"
                           onClick={() => handleStartEdit(thought)}
                           title="点击编辑"
+                          style={{ position: 'relative' }}
                         >
                           {thought.content}
+                          {/* 洞察提示图标 */}
+                          {thoughtInsights[thought.id]?.worthTalking && (
+                            <>
+                              <span
+                                className="insight-indicator"
+                                onMouseEnter={() => setHoveredThoughtId(thought.id)}
+                                onMouseLeave={() => setHoveredThoughtId(null)}
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  handleStartConversation(thought.id)
+                                }}
+                                style={{
+                                  position: 'absolute',
+                                  right: '40px',
+                                  top: '8px',
+                                  fontSize: '16px',
+                                  color: 'rgba(0, 0, 0, 0.3)',
+                                  cursor: 'pointer',
+                                  transition: 'color 0.2s',
+                                  zIndex: 10,
+                                  userSelect: 'none'
+                                }}
+                                onMouseOver={(e) => {
+                                  e.target.style.color = 'rgba(0, 0, 0, 0.6)'
+                                }}
+                                onMouseOut={(e) => {
+                                  e.target.style.color = 'rgba(0, 0, 0, 0.3)'
+                                }}
+                              >
+                                ！
+                              </span>
+                              {/* 悬停气泡 */}
+                              {hoveredThoughtId === thought.id && (
+                                <div
+                                  style={{
+                                    position: 'absolute',
+                                    right: '60px',
+                                    top: '0',
+                                    background: 'rgba(255, 255, 255, 0.98)',
+                                    border: '1px solid rgba(0, 0, 0, 0.12)',
+                                    borderRadius: '8px',
+                                    padding: '12px 16px',
+                                    boxShadow: '0 4px 12px rgba(0, 0, 0, 0.15)',
+                                    zIndex: 1000,
+                                    minWidth: '200px',
+                                    maxWidth: '280px',
+                                    fontSize: '13px',
+                                    color: 'rgba(0, 0, 0, 0.8)',
+                                    lineHeight: '1.5',
+                                    pointerEvents: 'auto'
+                                  }}
+                                  onMouseEnter={() => setHoveredThoughtId(thought.id)}
+                                  onMouseLeave={() => setHoveredThoughtId(null)}
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <p style={{ margin: '0 0 12px 0' }}>这里好像有个可以多想一步的地方</p>
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      handleStartConversation(thought.id)
+                                      setHoveredThoughtId(null)
+                                    }}
+                                    style={{
+                                      width: '100%',
+                                      padding: '8px 16px',
+                                      background: 'rgba(0, 0, 0, 0.05)',
+                                      border: '1px solid rgba(0, 0, 0, 0.1)',
+                                      borderRadius: '4px',
+                                      cursor: 'pointer',
+                                      fontSize: '13px',
+                                      color: 'rgba(0, 0, 0, 0.8)',
+                                      transition: 'all 0.2s',
+                                      fontWeight: '500'
+                                    }}
+                                    onMouseEnter={(e) => {
+                                      e.target.style.background = 'rgba(0, 0, 0, 0.1)'
+                                    }}
+                                    onMouseLeave={(e) => {
+                                      e.target.style.background = 'rgba(0, 0, 0, 0.05)'
+                                    }}
+                                  >
+                                    聊聊
+                                  </button>
+                                </div>
+                              )}
+                            </>
+                          )}
                         </div>
                         <div className="thought-time-mini">
                           {formatDate(thought.createdAt)}

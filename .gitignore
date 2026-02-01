@@ -43,3 +43,6 @@ htmlcov/
 *.njsproj
 *.sln
 *.sw?
+
+# Documentation
+docs/
